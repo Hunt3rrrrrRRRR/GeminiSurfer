@@ -1,0 +1,7 @@
+{
+  "name": "GeminiSurfer AI Browser",
+  "description": "A high-fidelity browser emulator that uses Gemini with Google Search grounding to simulate web browsing, allowing users to explore a hallucinated yet grounded web with real-time data.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
