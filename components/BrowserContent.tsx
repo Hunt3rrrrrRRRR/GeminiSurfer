@@ -14,11 +14,75 @@ interface BrowserContentProps {
   devToolsOpen?: boolean;
 }
 
+interface SerializableNode {
+  tagName: string;
+  id: string;
+  className: string;
+  children: SerializableNode[];
+  attributes: { name: string; value: string }[];
+  isText?: boolean;
+  textContent?: string;
+}
+
+const DOMNodeInspector: React.FC<{ node: SerializableNode; depth: number }> = ({ node, depth }) => {
+  const [isExpanded, setIsExpanded] = useState(depth < 2);
+
+  if (node.isText) {
+    if (!node.textContent?.trim()) return null;
+    return (
+      <div className="pl-4 py-0.5 text-gray-300 opacity-80 break-all">
+        "{node.textContent.trim()}"
+      </div>
+    );
+  }
+
+  const hasChildren = node.children.length > 0;
+
+  return (
+    <div className="font-mono text-[11px]">
+      <div 
+        className="flex items-center hover:bg-white/5 cursor-pointer group py-0.5 select-none"
+        onClick={() => setIsExpanded(!isExpanded)}
+        style={{ paddingLeft: `${depth * 12}px` }}
+      >
+        <span className={`mr-1 transition-transform ${isExpanded ? 'rotate-90' : ''} ${hasChildren ? 'opacity-100' : 'opacity-0'}`}>
+          ▶
+        </span>
+        <span className="text-purple-400">&lt;{node.tagName.toLowerCase()}</span>
+        {node.id && <span className="text-orange-300"> id="<span className="text-green-300">{node.id}</span>"</span>}
+        {node.className && <span className="text-orange-300"> class="<span className="text-green-300">{node.className}</span>"</span>}
+        {node.attributes.filter(a => a.name !== 'id' && a.name !== 'class').map(attr => (
+          <span key={attr.name} className="text-orange-300"> {attr.name}="<span className="text-green-300">{attr.value}</span>"</span>
+        ))}
+        <span className="text-purple-400">&gt;</span>
+        {!isExpanded && hasChildren && <span className="text-gray-500 ml-1">...</span>}
+        {!isExpanded && hasChildren && <span className="text-purple-400">&lt;/{node.tagName.toLowerCase()}&gt;</span>}
+      </div>
+      
+      {isExpanded && hasChildren && (
+        <div>
+          {node.children.map((child, i) => (
+            <DOMNodeInspector key={i} node={child} depth={depth + 1} />
+          ))}
+          <div className="py-0.5 text-purple-400" style={{ paddingLeft: `${depth * 12 + 12}px` }}>
+            &lt;/{node.tagName.toLowerCase()}&gt;
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const BrowserContent: React.FC<BrowserContentProps> = ({ 
   content, isLoading, error, onNavigate, currentUrl, historyItems = [], bookmarkItems = [], downloadItems = [], devToolsOpen = false
 }) => {
   const iframeRef = useRef<HTMLIFrameElement>(null);
-  const [activeDevTab, setActiveDevTab] = useState<'console' | 'elements' | 'network'>('console');
+  const [activeDevTab, setActiveDevTab] = useState<'console' | 'elements' | 'network' | 'sources' | 'performance'>('console');
+  const [domTree, setDomTree] = useState<SerializableNode | null>(null);
+  
+  // Local state for bookmarks view
+  const [bookmarkSort, setBookmarkSort] = useState<'name' | 'date' | 'url'>('date');
+  const [bookmarkQuery, setBookmarkQuery] = useState('');
 
   useEffect(() => {
     const handleMessage = (e: MessageEvent) => { 
@@ -29,6 +93,75 @@ const BrowserContent: React.FC<BrowserContentProps> = ({
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
   }, [onNavigate]);
+
+  const refreshDomTree = () => {
+    if (!iframeRef.current || !iframeRef.current.contentDocument) return;
+    
+    const serialize = (el: Node): SerializableNode | null => {
+      if (el.nodeType === Node.TEXT_NODE) {
+        return {
+          tagName: '',
+          id: '',
+          className: '',
+          children: [],
+          attributes: [],
+          isText: true,
+          textContent: el.textContent || ''
+        };
+      }
+      
+      if (el.nodeType !== Node.ELEMENT_NODE) return null;
+      
+      const element = el as HTMLElement;
+      if (element.tagName === 'SCRIPT' || element.tagName === 'STYLE') return null;
+
+      const children: SerializableNode[] = [];
+      element.childNodes.forEach(child => {
+        const s = serialize(child);
+        if (s) children.push(s);
+      });
+
+      const attributes: { name: string; value: string }[] = [];
+      for (let i = 0; i < element.attributes.length; i++) {
+        const attr = element.attributes[i];
+        attributes.push({ name: attr.name, value: attr.value });
+      }
+
+      return {
+        tagName: element.tagName,
+        id: element.id,
+        className: element.className,
+        attributes,
+        children
+      };
+    };
+
+    const tree = serialize(iframeRef.current.contentDocument.documentElement);
+    setDomTree(tree);
+  };
+
+  useEffect(() => {
+    if (activeDevTab === 'elements' && devToolsOpen) {
+      refreshDomTree();
+      const interval = setInterval(refreshDomTree, 2000);
+      return () => clearInterval(interval);
+    }
+  }, [activeDevTab, devToolsOpen, content]);
+
+  const sortedBookmarks = useMemo(() => {
+    let filtered = bookmarkItems.filter(b => 
+      b.title.toLowerCase().includes(bookmarkQuery.toLowerCase()) || 
+      b.url.toLowerCase().includes(bookmarkQuery.toLowerCase())
+    );
+
+    if (bookmarkSort === 'name') {
+      return [...filtered].sort((a, b) => a.title.localeCompare(b.title));
+    } else if (bookmarkSort === 'url') {
+      return [...filtered].sort((a, b) => a.url.localeCompare(b.url));
+    } else {
+      return [...filtered].sort((a, b) => b.timestamp - a.timestamp);
+    }
+  }, [bookmarkItems, bookmarkSort, bookmarkQuery]);
 
   if (isLoading) return (
     <div className="h-full w-full flex flex-col items-center justify-center bg-[#0e0f11]">
@@ -48,6 +181,83 @@ const BrowserContent: React.FC<BrowserContentProps> = ({
       </div>
     </div>
   );
+
+  // Chromium Internal Page: Bookmarks
+  if (currentUrl === 'about:bookmarks') {
+    return (
+      <div className="h-full bg-[#f8f9fa] dark:bg-[#202124] flex flex-col overflow-hidden">
+        <div className="bg-[#1a73e8] p-4 flex items-center shadow-md">
+          <div className="flex items-center gap-4 text-white">
+            <StarIcon className="w-6 h-6" fill="currentColor" />
+            <h1 className="text-xl font-medium">Bookmarks</h1>
+          </div>
+          <div className="flex-1 max-w-2xl mx-auto">
+            <div className="relative group">
+              <div className="absolute left-3 top-1/2 -translate-y-1/2">
+                <MagnifyingGlass className="w-4 h-4 text-gray-400 group-focus-within:text-white" />
+              </div>
+              <input 
+                value={bookmarkQuery}
+                onChange={(e) => setBookmarkQuery(e.target.value)}
+                placeholder="Search bookmarks" 
+                className="w-full bg-white/10 text-white rounded py-2 pl-10 pr-4 border border-transparent focus:bg-white/20 focus:outline-none transition-all placeholder-white/60"
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="flex-1 flex overflow-hidden">
+          <div className="w-64 border-r border-[#dee1e6] dark:border-[#3c4043] p-4 space-y-2 pt-8">
+            <h2 className="text-[11px] font-bold text-gray-500 uppercase px-4 mb-4 tracking-wider">Sort by</h2>
+            {[
+              { id: 'date', label: 'Date Added' },
+              { id: 'name', label: 'Name' },
+              { id: 'url', label: 'URL' }
+            ].map(option => (
+              <button 
+                key={option.id}
+                onClick={() => setBookmarkSort(option.id as any)}
+                className={`w-full text-left px-4 py-2 text-sm rounded-r-full transition-colors ${bookmarkSort === option.id ? 'bg-[#e8f0fe] dark:bg-[#1a73e820] text-[#1a73e8] font-medium' : 'text-[#5f6368] dark:text-[#bdc1c6] hover:bg-black/5 dark:hover:bg-white/5'}`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-8 dark:text-[#e8eaed]">
+            <div className="max-w-4xl mx-auto space-y-4">
+              {sortedBookmarks.length > 0 ? (
+                sortedBookmarks.map((bookmark, idx) => (
+                  <div 
+                    key={idx} 
+                    onClick={() => onNavigate(bookmark.url)}
+                    className="flex items-center p-3 bg-white dark:bg-[#292a2d] rounded-lg border border-[#dee1e6] dark:border-[#3c4043] hover:shadow-md transition-all cursor-pointer group"
+                  >
+                    <div className="w-10 h-10 bg-gray-100 dark:bg-[#3c4043] rounded flex items-center justify-center mr-4">
+                      {bookmark.favicon ? (
+                        <img src={bookmark.favicon} className="w-5 h-5" alt="" />
+                      ) : (
+                        <GlobeAlt className="w-5 h-5 text-gray-400" />
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <h3 className="font-medium text-sm truncate group-hover:text-[#1a73e8] transition-colors">{bookmark.title || bookmark.url}</h3>
+                      <p className="text-xs text-gray-500 truncate">{bookmark.url}</p>
+                    </div>
+                    <div className="text-[10px] text-gray-400 font-mono ml-4">
+                      {new Date(bookmark.timestamp).toLocaleDateString()}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="text-center py-20 text-gray-500 italic">No bookmarks found.</div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // Chromium Internal Page: Settings
   if (currentUrl === 'about:settings') {
@@ -154,7 +364,7 @@ const BrowserContent: React.FC<BrowserContentProps> = ({
              { name: 'GitHub', url: 'github.com', color: 'bg-black text-white', char: 'G' },
              { name: 'Google', url: 'google.com', color: 'bg-[#4285F4] text-white', char: 'G' },
              { name: 'Reddit', url: 'reddit.com', color: 'bg-[#FF4500] text-white', char: 'R' },
-             { name: 'Settings', url: 'chrome://settings', color: 'bg-gray-500 text-white', char: 'S' },
+             { name: 'Bookmarks', url: 'chrome://bookmarks', color: 'bg-yellow-500 text-white', char: 'B' },
              { name: 'YouTube', url: 'youtube.com', color: 'bg-[#FF0000] text-white', char: 'Y' },
              { name: 'Netflix', url: 'netflix.com', color: 'bg-[#E50914] text-white', char: 'N' },
              { name: 'Vercel', url: 'vercel.com', color: 'bg-black text-white', char: 'V' }
@@ -218,15 +428,29 @@ const BrowserContent: React.FC<BrowserContentProps> = ({
             <button onClick={() => setActiveDevTab('console')} className="p-2 text-gray-500 hover:text-white"><XIcon className="w-4 h-4" /></button>
           </div>
           <div className="flex-1 overflow-y-auto p-4 space-y-2 bg-[#1c1d1f]">
-             <div className="flex gap-3"><span className="text-[#1a73e8] font-bold">[ENGINE]</span><span>Chromium 130.0.0.0 initializing...</span></div>
-             <div className="flex gap-3 text-blue-400"><span>[NET]</span><span>GET {currentUrl} - STATUS: 200 OK (CACHED)</span></div>
-             <div className="flex gap-3 text-green-400"><span>[DOM]</span><span>Parsing AI-generated HTML stream... Success.</span></div>
-             <div className="flex gap-3 text-yellow-500"><span>[WARN]</span><span>Mixed content detected but upgraded to HTTPS.</span></div>
-             <div className="flex gap-3 text-gray-500 italic"><span>[INFO]</span><span>Grounding active: {content.metadata?.sources?.length || 0} external nodes used for synthesis.</span></div>
-             <div className="pt-2 border-t border-white/5">
-                <span className="text-gray-500">&gt; </span>
-                <input className="bg-transparent outline-none w-full text-white" placeholder="Run JavaScript..." />
-             </div>
+             {activeDevTab === 'elements' ? (
+               <div className="animate-slide-up">
+                 {domTree ? (
+                   <DOMNodeInspector node={domTree} depth={0} />
+                 ) : (
+                   <div className="text-gray-500 italic">Capturing DOM tree...</div>
+                 )}
+               </div>
+             ) : activeDevTab === 'console' ? (
+               <>
+                 <div className="flex gap-3"><span className="text-[#1a73e8] font-bold">[ENGINE]</span><span>Chromium 130.0.0.0 initializing...</span></div>
+                 <div className="flex gap-3 text-blue-400"><span>[NET]</span><span>GET {currentUrl} - STATUS: 200 OK (CACHED)</span></div>
+                 <div className="flex gap-3 text-green-400"><span>[DOM]</span><span>Parsing AI-generated HTML stream... Success.</span></div>
+                 <div className="flex gap-3 text-yellow-500"><span>[WARN]</span><span>Mixed content detected but upgraded to HTTPS.</span></div>
+                 <div className="flex gap-3 text-gray-500 italic"><span>[INFO]</span><span>Grounding active: {content.metadata?.sources?.length || 0} external nodes used for synthesis.</span></div>
+                 <div className="pt-2 border-t border-white/5">
+                    <span className="text-gray-500">&gt; </span>
+                    <input className="bg-transparent outline-none w-full text-white" placeholder="Run JavaScript..." />
+                 </div>
+               </>
+             ) : (
+               <div className="text-gray-500 italic">Waiting for telemetry data from the rendering engine...</div>
+             )}
           </div>
         </div>
       )}
